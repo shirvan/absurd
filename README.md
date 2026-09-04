@@ -10,10 +10,11 @@ client, durable task helpers, and OTP-supervised workers.
 
 | Elixir SDK | Absurd schema | Elixir / OTP | Release verification |
 |---|---|---|---|
+| `0.2.x` | [`0.5.0`](https://github.com/earendil-works/absurd/tree/0.5.0) | Elixir 1.18+ / OTP 27+ | PostgreSQL 16; OTP 27, 28, and 29 |
 | `0.1.x` | [`0.5.0`](https://github.com/earendil-works/absurd/tree/0.5.0) | Elixir 1.18+ / OTP 27+ | PostgreSQL 16; OTP 27, 28, and 29 |
 
-The package version and Absurd version are independent: SDK `0.1.0` is the
-first Elixir release and supports exactly the Absurd `0.5.0` schema. A worker
+The package version and Absurd version are independent: SDK `0.2.x` supports
+exactly the Absurd `0.5.0` schema, as did the initial `0.1.x` release. A worker
 pool verifies that schema version before it starts claiming work.
 
 The supported version is available at runtime and can be verified against the
@@ -32,15 +33,12 @@ The SDK never installs or migrates the schema.
 
 ## Installation
 
-The SDK is not published on Hex. Add the tagged release from
-[GitHub](https://github.com/shirvan/absurd) to `mix.exs`:
+Add the package from [Hex](https://hex.pm/packages/absurd) to `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:absurd,
-     git: "https://github.com/shirvan/absurd.git",
-     tag: "0.1.0"}
+    {:absurd, "~> 0.2.0"}
   ]
 end
 ```

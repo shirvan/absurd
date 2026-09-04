@@ -12,7 +12,7 @@ defmodule Absurd.SQL do
   The module validates protocol values before issuing a query and maps database
   failures to `Absurd.Error`.
 
-  SDK `0.1.x` targets exactly schema `0.5.0`:
+  SDK `0.2.x` targets exactly schema `0.5.0`:
 
       iex> Absurd.SQL.supported_schema_version()
       "0.5.0"

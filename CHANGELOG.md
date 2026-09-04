@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.0 - 2026-09-04
+
+### Added
+
+- Public architecture and human-focused contribution guides.
+- A dependency-free worker throughput script for local comparisons.
+- Regression coverage for supervision recovery and stale lease timers.
+- CI validation that the release package can be built from repository contents.
+
+### Changed
+
+- Expanded internal documentation to explain the intent behind worker and
+  lifecycle code.
+
 ## 0.1.0 - 2026-09-03
 
 Initial public release.

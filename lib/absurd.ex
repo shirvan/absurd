@@ -2,7 +2,7 @@ defmodule Absurd do
   @moduledoc """
   Unofficial Elixir client and OTP worker application for Absurd.
 
-  SDK `0.1.x` supports the upstream Absurd `0.5.0` schema. The SDK and schema
+  SDK `0.2.x` supports the upstream Absurd `0.5.0` schema. The SDK and schema
   versions are independent; `Absurd.SQL.verify_schema_version/2` checks the
   database explicitly, and every `Absurd.WorkerPool` checks it at startup.
 
