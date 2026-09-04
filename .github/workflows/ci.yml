@@ -85,3 +85,7 @@ jobs:
 
       - name: Run quality gate
         run: mix check
+
+      - name: Build release package
+        if: matrix.elixir == '1.20.4'
+        run: mix hex.build --output /tmp/absurd.tar
