@@ -45,13 +45,20 @@ defmodule Absurd.MixProject do
       main: "readme",
       source_url: "https://github.com/shirvan/absurd",
       source_ref: "0.1.0",
-      extras: ["README.md", "CHANGELOG.md", "LICENSE"]
+      extras: [
+        "README.md",
+        "ARCHITECTURE.md",
+        "CONTRIBUTING.md",
+        "CHANGELOG.md",
+        "LICENSE"
+      ]
     ]
   end
 
   defp package do
     [
-      files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE),
+      files:
+        ~w(lib .formatter.exs mix.exs README.md ARCHITECTURE.md CONTRIBUTING.md CHANGELOG.md LICENSE),
       licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => "https://github.com/shirvan/absurd",

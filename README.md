@@ -6,8 +6,6 @@ An unofficial, community-maintained Elixir SDK for
 [Absurd](https://github.com/earendil-works/absurd). It provides a process-free
 client, durable task helpers, and OTP-supervised workers.
 
-This project is not affiliated with or endorsed by the upstream Absurd project.
-
 ## Compatibility
 
 | Elixir SDK | Absurd schema | Elixir / OTP | Release verification |
@@ -52,6 +50,7 @@ create a hidden connection pool.
 
 ## Guide
 
+- [Architecture](ARCHITECTURE.md)
 - [Quick start](#quick-start)
 - [Clients and database ownership](#clients-and-database-ownership)
 - [Queue management](#queue-management)
@@ -829,6 +828,9 @@ ownership of connection, transaction, timeout, and retry policy.
   authority.
 
 ## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the fork and pull-request workflow,
+local checks, integration database setup, and useful bug-report details.
 
 Run the complete formatter, warnings-as-errors compiler, strict Credo, test,
 doctest, documentation coverage, and ExDoc gate with:
