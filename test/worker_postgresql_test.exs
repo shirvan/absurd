@@ -180,6 +180,47 @@ defmodule Absurd.WorkerPostgreSQLTest do
     end
   end
 
+  test "a runner supervisor failure restarts capacity accounting and the pool recovers",
+       context do
+    pool =
+      start_pool(context, [Echo, Gate],
+        concurrency: 1,
+        batch_size: 1,
+        shutdown: 100
+      )
+
+    assert {:ok, interrupted} =
+             Client.spawn(context.client, Gate, %{"token" => "supervisor-failure"})
+
+    assert_receive {:gate_started, "supervisor-failure", runner, _queue, _task_id}, 1_000
+
+    old_runner_supervisor = runner_supervisor_pid(pool)
+    old_poller = poller_pid(pool)
+    runner_ref = Process.monitor(runner)
+    runner_supervisor_ref = Process.monitor(old_runner_supervisor)
+    poller_ref = Process.monitor(old_poller)
+
+    Process.exit(old_runner_supervisor, :kill)
+
+    assert_receive {:DOWN, ^runner_supervisor_ref, :process, ^old_runner_supervisor, :killed},
+                   1_000
+
+    assert_receive {:DOWN, ^runner_ref, :process, ^runner, _reason}, 1_000
+    assert_receive {:DOWN, ^poller_ref, :process, ^old_poller, _reason}, 2_000
+
+    assert :ok =
+             wait_until(fn ->
+               runner_supervisor_pid(pool) not in [nil, old_runner_supervisor] and
+                 poller_pid(pool) not in [nil, old_poller]
+             end)
+
+    assert :ok = Client.cancel_task(context.client, interrupted)
+    assert {:ok, next_task} = Client.spawn(context.client, Echo, %{"pool" => "recovered"})
+
+    assert {:ok, %TaskResult{state: :completed}} =
+             Client.await_task_result(context.client, next_task, timeout: 2_000)
+  end
+
   test "cancellation wins a completion race without stopping the pool", context do
     _pool = start_pool(context, [Echo, Gate], concurrency: 1, batch_size: 1)
 
@@ -390,6 +431,17 @@ defmodule Absurd.WorkerPostgreSQLTest do
     |> Supervisor.which_children()
     |> Enum.find_value(fn
       {Absurd.Poller, pid, :worker, _modules} -> pid
+      _child -> nil
+    end)
+  catch
+    :exit, _reason -> nil
+  end
+
+  defp runner_supervisor_pid(pool) do
+    pool
+    |> Supervisor.which_children()
+    |> Enum.find_value(fn
+      {{WorkerPool, :runner_supervisor}, pid, :supervisor, _modules} -> pid
       _child -> nil
     end)
   catch
