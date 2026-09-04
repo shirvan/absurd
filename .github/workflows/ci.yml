@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.18.4"
+            otp: "27"
+          - elixir: "1.19.5"
+            otp: "28"
+          - elixir: "1.20.4"
+            otp: "29"
+
+    services:
+      postgres:
+        image: postgres:16-alpine3.22
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: absurd_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d absurd_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MIX_ENV: test
+      ABSURD_INTEGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/absurd_test
+      ABSURD_SQL_URL: https://raw.githubusercontent.com/earendil-works/absurd/550d3b9e6f9382d96178de6ab8c90c7f8edf2227/sql/absurd.sql
+      ABSURD_SQL_SHA256: d34309370c539f3a51f2b36b69b1f77551f8e4a14480a1c8def8bb8f40fd9aab
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Elixir and Erlang/OTP
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Install Absurd 0.5.0 schema
+        run: |
+          curl --fail --silent --show-error --location \
+            "$ABSURD_SQL_URL" \
+            --output /tmp/absurd.sql
+          printf '%s  %s\n' "$ABSURD_SQL_SHA256" /tmp/absurd.sql \
+            | sha256sum --check
+          PGPASSWORD=postgres psql \
+            --host localhost \
+            --username postgres \
+            --dbname absurd_test \
+            --set ON_ERROR_STOP=1 \
+            --file /tmp/absurd.sql
+
+      - name: Check dependencies
+        run: |
+          mix deps.unlock --check-unused
+          mix hex.audit
+
+      - name: Run quality gate
+        run: mix check
