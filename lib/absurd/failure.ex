@@ -1,5 +1,7 @@
 defmodule Absurd.Failure do
   # Internal serialization boundary shared by runners and focused protocol tests.
+  # Arbitrary task failures become bounded, JSON-safe diagnostics before they are
+  # persisted; the original exception never becomes part of the wire protocol.
   @moduledoc false
 
   @maximum_name_bytes 128
@@ -49,6 +51,8 @@ defmodule Absurd.Failure do
   end
 
   defp truncate(value, maximum) do
+    # Measure bytes because both storage and telemetry budgets are byte-oriented.
+    # Normalize invalid strings first, then reserve room for an explicit ellipsis.
     value = ensure_valid_utf8(value, maximum)
 
     if byte_size(value) <= maximum do
@@ -69,6 +73,8 @@ defmodule Absurd.Failure do
   end
 
   defp valid_prefix(value, size) do
+    # A byte cut may land inside a multi-byte UTF-8 code point. Walk backward to
+    # the nearest valid boundary so truncation cannot create invalid diagnostics.
     prefix = binary_part(value, 0, size)
 
     if String.valid?(prefix) do

@@ -73,6 +73,9 @@ defmodule Absurd.SQL do
   @checkpoint_read_defaults [include_pending: false, query_options: []]
   @event_wait_defaults [timeout: :infinity, query_options: []]
   @cleanup_defaults [ttl: nil, limit: 1_000, query_options: []]
+  # If the connection disappears after one of these operations was sent, the
+  # client cannot know whether PostgreSQL committed it. That uncertainty is part
+  # of the result contract and must not be collapsed into an ordinary DB error.
   @mutating_operations [
     :create_queue,
     :set_queue_policy,
@@ -503,6 +506,8 @@ defmodule Absurd.SQL do
           query_options()
         ) :: :ok | {:error, Error.t()}
   def schedule_run_after(db, queue, run_id, duration, query_options \\ []) do
+    # Compute the wake time beside the durable state. Using the database clock
+    # avoids application-node skew changing the requested relative delay.
     statement = """
     SELECT absurd.schedule_run(
       $1,
@@ -565,6 +570,9 @@ defmodule Absurd.SQL do
           keyword()
         ) :: :ok | {:error, Error.t()}
   def set_task_checkpoint_state(db, queue, task_id, step_name, state, owner_run_id, options \\ []) do
+    # The upstream function verifies claim ownership, persists the checkpoint,
+    # and optionally extends the lease as one operation. Splitting those actions
+    # client-side would leave a committed effect paired with an expired claim.
     statement = """
     SELECT absurd.set_task_checkpoint_state($1, $2, $3, $4::jsonb, $5, $6)
     """
@@ -802,6 +810,9 @@ defmodule Absurd.SQL do
   end
 
   defp query(db, statement, params, query_options, operation) do
+    # All SQL crosses this one observation and error-classification boundary.
+    # Deliberately do not retry here: for a mutating call, losing the response can
+    # mean the write committed, so an automatic replay may duplicate intent.
     Telemetry.span(:sql, operation, telemetry_metadata(operation, params), fn ->
       case Postgrex.query(db, statement, params, query_options) do
         {:ok, result} ->
@@ -898,6 +909,8 @@ defmodule Absurd.SQL do
     end
   end
 
+  # Schema durations are whole seconds. Always round up: rounding a positive
+  # lease or timeout down could make it expire earlier than the caller requested.
   defp milliseconds_to_seconds(milliseconds), do: div(milliseconds + 999, 1_000)
   defp optional_milliseconds_to_seconds(nil), do: nil
   defp optional_milliseconds_to_seconds(milliseconds), do: milliseconds_to_seconds(milliseconds)
@@ -920,6 +933,8 @@ defmodule Absurd.SQL do
       normalized =
         policy
         |> Keyword.put(:detach_mode, detach_mode)
+        # Omitted fields must stay omitted so the database can retain existing
+        # policy values; sending JSON null would carry different update intent.
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
 
@@ -955,6 +970,8 @@ defmodule Absurd.SQL do
   end
 
   defp normalize_spawn_options(options) do
+    # Keep Postgrex transport options outside the JSON document and translate
+    # public atom keys to the schema's stable snake-case wire representation.
     with {:ok, options} <- validate_keywords(options, @spawn_option_defaults, :spawn_task),
          :ok <- validate_positive_optional(options[:max_attempts], :max_attempts, :spawn_task),
          {:ok, retry_strategy} <- normalize_retry_strategy(options[:retry_strategy]),
@@ -1073,6 +1090,8 @@ defmodule Absurd.SQL do
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
 
+      # An empty policy means "use no override," not an object that replaces
+      # database defaults with missing fields.
       if map_size(normalized) == 0, do: {:ok, nil}, else: {:ok, normalized}
     end
   end
@@ -1121,6 +1140,9 @@ defmodule Absurd.SQL do
   defp put_if_present(map, key, value), do: Map.put(map, key, value)
 
   defp shape_claimed_tasks(rows) do
+    # Decode the entire result or reject it. A malformed row means the SDK/schema
+    # contract is broken, so dispatching a seemingly valid prefix would hide that
+    # protocol failure. Any undispatched claims remain recoverable by lease expiry.
     Enum.reduce_while(rows, {:ok, []}, fn row, {:ok, tasks} ->
       case shape_claimed_task(row) do
         {:ok, task} -> {:cont, {:ok, [task | tasks]}}
@@ -1316,6 +1338,8 @@ defmodule Absurd.SQL do
   defp decode_task_state(value), do: unexpected_value(:task_state, value)
 
   defp unexpected_rows(operation, rows) do
+    # Row shapes are the SDK/schema protocol. Treat drift as a protocol error
+    # instead of coercing surprising data into structs that look trustworthy.
     {:error,
      Error.new(:protocol, "unexpected rows returned by Absurd SQL",
        operation: operation,

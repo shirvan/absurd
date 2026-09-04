@@ -1,5 +1,11 @@
 defmodule Absurd.Poller do
-  # Internal worker-pool child that owns claiming and runner capacity accounting.
+  # The poller is the worker pool's single capacity accountant. PostgreSQL owns
+  # the durable work; this process only decides how many claims may be admitted
+  # to this local pool.
+  #
+  # Invariant: `active` contains one monitor reference for every live runner.
+  # Claims are limited to `concurrency - map_size(active)` so a pool cannot
+  # oversubscribe itself even when polls and runner exits happen close together.
   @moduledoc false
 
   use GenServer
@@ -32,6 +38,8 @@ defmodule Absurd.Poller do
 
   @impl GenServer
   def init(options) do
+    # Trapping exits routes supervisor shutdown through terminate/2. That lets us
+    # stop polling first, then give already-running callbacks time to finish.
     Process.flag(:trap_exit, true)
 
     state =
@@ -51,6 +59,9 @@ defmodule Absurd.Poller do
 
   @impl GenServer
   def handle_info({:poll, token}, %{poll_token: token} = state) do
+    # Only the most recently scheduled poll may claim work. A cancelled timer can
+    # already be in the mailbox, so matching the token is stronger than merely
+    # cancelling its timer reference.
     state = %{state | poll_timer: nil, poll_token: nil}
     {:noreply, state |> ensure_runner_supervisor() |> claim_available_capacity()}
   end
@@ -59,6 +70,8 @@ defmodule Absurd.Poller do
 
   def handle_info({:DOWN, reference, :process, _pid, _reason}, state) do
     if Map.has_key?(state.active, reference) do
+      # Runner completion returns one unit of capacity. Poll immediately so a
+      # busy queue does not wait for the ordinary polling interval.
       next_state = %{state | active: Map.delete(state.active, reference)}
       {:noreply, schedule_poll(next_state, 0)}
     else
@@ -74,12 +87,17 @@ defmodule Absurd.Poller do
 
   @impl GenServer
   def terminate(_reason, state) do
+    # The poller does not kill runners here. It waits until they finish or the
+    # pool's shutdown budget expires; the DynamicSupervisor is stopped next and
+    # enforces the final teardown.
     cancel_timer(state.poll_timer)
     deadline = System.monotonic_time(:millisecond) + state.shutdown
     drain_runners(state.active, deadline)
   end
 
   defp ensure_runner_supervisor(%{runner_supervisor: nil} = state) do
+    # The DynamicSupervisor is intentionally unnamed, so find the sibling by its
+    # stable child id after both children have entered the pool supervisor.
     runner_supervisor =
       state.pool
       |> Supervisor.which_children()
@@ -96,10 +114,15 @@ defmodule Absurd.Poller do
   defp ensure_runner_supervisor(state), do: state
 
   defp monitor_existing_runners(%{runner_supervisor: nil} = state) do
+    # Startup ordering should make this uncommon, but a short retry keeps a
+    # transient supervision race from becoming a crash loop.
     schedule_poll(state, 10)
   end
 
   defp monitor_existing_runners(state) do
+    # With :rest_for_one, a poller restart does not terminate older runners.
+    # Rebuild the monitor set before claiming so their occupied capacity remains
+    # accounted for and the restarted poller cannot over-claim.
     monitored = MapSet.new(Map.values(state.active))
 
     active =
@@ -123,6 +146,8 @@ defmodule Absurd.Poller do
   defp claim_available_capacity(%{runner_supervisor: nil} = state), do: state
 
   defp claim_available_capacity(state) do
+    # `batch_size` bounds each database round trip; local capacity is the harder
+    # limit and may be smaller while other runners are still active.
     capacity = max(state.concurrency - map_size(state.active), 0)
 
     if capacity == 0 do
@@ -141,6 +166,8 @@ defmodule Absurd.Poller do
 
     case SQL.claim_tasks(state.db, state.queue, state.worker_id, options) do
       {:ok, tasks} ->
+        # A successful database round trip proves the dependency recovered, even
+        # when it returned no rows, so the next failure starts a fresh backoff.
         dispatch_claimed_tasks(%{state | error_attempt: 0}, tasks, amount)
 
       {:error, %Error{} = error} ->
@@ -168,6 +195,9 @@ defmodule Absurd.Poller do
 
     remaining_capacity = max(state.concurrency - map_size(state.active), 0)
 
+    # A full claim batch is evidence that more work may already be available.
+    # Fill the remaining local capacity without an artificial interval. An empty
+    # or partial batch goes back to normal polling to avoid hammering PostgreSQL.
     cond do
       failed_starts > 0 -> schedule_poll(state, state.poll_interval)
       length(tasks) == amount and remaining_capacity > 0 -> schedule_poll(state, 0)
@@ -202,6 +232,8 @@ defmodule Absurd.Poller do
             "#{inspect(state.queue)}: #{inspect(reason, limit: 20, printable_limit: 1_000)}"
         )
 
+        # The row is already claimed even though no runner exists. Explicitly
+        # release it instead of making another worker wait for lease expiration.
         release_unstarted_claim(state, task)
         {:error, state}
     end
@@ -228,6 +260,8 @@ defmodule Absurd.Poller do
   end
 
   defp schedule_error_backoff(state) do
+    # Database failures use capped exponential backoff with positive jitter. The
+    # jitter spreads reconnect traffic across pools after a shared outage.
     base =
       min(
         state.poll_interval * Integer.pow(2, min(state.error_attempt, 16)),
@@ -244,6 +278,8 @@ defmodule Absurd.Poller do
   end
 
   defp schedule_poll(state, delay) do
+    # Replace, rather than accumulate, future polls. The token also makes any
+    # already-delivered message from the cancelled timer harmless.
     cancel_timer(state.poll_timer)
     token = make_ref()
     timer = Process.send_after(self(), {:poll, token}, delay)
@@ -256,6 +292,8 @@ defmodule Absurd.Poller do
   defp drain_runners(active, _deadline) when map_size(active) == 0, do: :ok
 
   defp drain_runners(active, deadline) do
+    # Every recursive wait shares one fixed deadline. A stream of runner exits
+    # must not reset the full shutdown allowance after each DOWN message.
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do

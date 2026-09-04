@@ -69,6 +69,9 @@ defmodule Absurd.WorkerPool do
   """
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(options) do
+    # Finish every fallible configuration check before starting supervision. A
+    # pool that cannot dispatch its catalog or understand the installed schema
+    # must never begin claiming durable work.
     with {:ok, validated} <- validate_options(options),
          {:ok, catalog} <- TaskCatalog.new(validated[:tasks], validated[:queue]),
          :ok <- SQL.verify_schema_version(validated[:db], validated[:query_options]) do
@@ -79,6 +82,9 @@ defmodule Absurd.WorkerPool do
 
   @impl Supervisor
   def init(options) do
+    # Child order is part of the lifecycle contract. The poller needs the runner
+    # supervisor to exist before it claims, and supervisor shutdown happens in
+    # reverse order so the poller can drain runners before their owner stops.
     runner_supervisor = %{
       id: @runner_supervisor_id,
       start: {DynamicSupervisor, :start_link, [[strategy: :one_for_one]]},
@@ -92,6 +98,9 @@ defmodule Absurd.WorkerPool do
       |> Keyword.put(:pool, self())
       |> Keyword.put(:runner_supervisor_id, @runner_supervisor_id)
 
+    # :rest_for_one couples capacity accounting to the process it accounts for:
+    # if the runner supervisor dies, restart the poller too; if only the poller
+    # dies, preserve live runners and let its replacement monitor them again.
     Supervisor.init([runner_supervisor, {Poller, poller_options}], strategy: :rest_for_one)
   end
 
@@ -126,6 +135,8 @@ defmodule Absurd.WorkerPool do
   end
 
   defp validate_values(options) do
+    # A missing batch size means "claim up to this pool's concurrency." Normalize
+    # it once so the poller operates on concrete values only.
     concurrency = options[:concurrency]
     batch_size = options[:batch_size] || concurrency
 
@@ -143,6 +154,8 @@ defmodule Absurd.WorkerPool do
          :ok <- validate_worker_id(options[:worker_id]),
          :ok <- validate_hooks(options[:hooks]),
          :ok <- validate_query_options(options[:query_options]) do
+      # Database leases have whole-second resolution. Round upward so the local
+      # watchdog never expires before the lease PostgreSQL actually records.
       {:ok, Keyword.update!(options, :claim_timeout, &effective_duration/1)}
     end
   end

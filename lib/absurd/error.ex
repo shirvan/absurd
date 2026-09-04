@@ -67,6 +67,9 @@ defmodule Absurd.Error do
   """
   @spec from_exception(Exception.t(), atom() | nil, keyword()) :: t()
   def from_exception(exception, operation \\ nil, options \\ []) do
+    # Preserve the schema's semantic SQLSTATEs before applying transport-level
+    # classification. Callers should not need Postgrex-specific pattern matches
+    # to distinguish cancellation from an ordinary database failure.
     sqlstate = sqlstate(exception)
 
     new(kind_for_exception(exception, sqlstate, options), Exception.message(exception),
@@ -91,6 +94,9 @@ defmodule Absurd.Error do
          options
        )
        when reason != :queue_timeout do
+    # A checkout timeout happens before a connection executes the statement, so
+    # its outcome is known to be "not sent." Other connection loss may occur
+    # after PostgreSQL committed and is ambiguous for mutating operations.
     if Keyword.get(options, :ambiguous?, false), do: :ambiguous, else: :database
   end
 

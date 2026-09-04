@@ -122,6 +122,9 @@ defmodule Absurd.Context do
   @spec new(Absurd.Client.queryable(), String.t(), ClaimedTask.t(), keyword()) ::
           {:ok, t()} | {:error, Error.t()}
   def new(db, queue, %ClaimedTask{} = task, options \\ []) do
+    # Load every checkpoint visible to this claimed run before user code starts.
+    # The Agent built below is only an execution-local cache; this database read
+    # is what makes a retried attempt resume from previously committed work.
     with {:ok, queue} <- Name.validate_queue(queue),
          {:ok, options} <- validate_options(options),
          :ok <- validate_db(db),
@@ -183,6 +186,8 @@ defmodule Absurd.Context do
   """
   @spec step(t(), String.t(), (-> Absurd.Task.result())) :: Absurd.Task.result()
   def step(%__MODULE__{} = context, name, callback) when is_function(callback, 0) do
+    # Allocate the occurrence before deciding whether to run. On replay the same
+    # occurrence resolves to its committed value and user code is skipped.
     with {:ok, handle} <- begin_step(context, name) do
       if handle.done do
         {:ok, handle.value}
@@ -223,6 +228,8 @@ defmodule Absurd.Context do
     do: {:ok, value}
 
   def complete_step(%__MODULE__{} = context, %Step{} = handle, value) do
+    # Checkpoint persistence and lease extension happen in one database operation.
+    # Update the local cache and watchdog only after that durable write succeeds.
     with {:ok, checkpoint_name} <- Name.validate_durable(handle.checkpoint_name, :step),
          :ok <- JSON.validate(value),
          :ok <-
@@ -380,6 +387,8 @@ defmodule Absurd.Context do
       {:ok, value} ->
         complete_step(context, handle, value)
 
+      # Failed callbacks deliberately leave no checkpoint. A later task attempt
+      # must be allowed to execute the occurrence again.
       {:error, _reason} = error ->
         error
 
@@ -397,6 +406,9 @@ defmodule Absurd.Context do
   end
 
   defp allocate_checkpoint_name(context, name) do
+    # Occurrence numbers are deterministic only when task control flow is
+    # deterministic. Retried executions must reach repeated names in the same
+    # order for `name`, `name#2`, ... to identify the same durable effects.
     Agent.get_and_update(context.state, fn state ->
       count = Map.get(state.counters, name, 0) + 1
       checkpoint_name = if count == 1, do: name, else: "#{name}##{count}"
@@ -405,6 +417,8 @@ defmodule Absurd.Context do
   end
 
   defp lookup_checkpoint(context, checkpoint_name) do
+    # Prefer the preload/cache, but treat a cache miss as inconclusive. PostgreSQL
+    # remains the authority for whether this run can see a committed checkpoint.
     case Agent.get(context.state, &Map.fetch(&1.checkpoints, checkpoint_name)) do
       {:ok, value} ->
         {:ok, {:found, value}}
@@ -442,6 +456,8 @@ defmodule Absurd.Context do
     do: decode_wake_at(value)
 
   defp checkpoint_wake_at(context, %Step{} = handle, wake_at) do
+    # Persist an absolute instant on first execution. Recomputing `now + duration`
+    # after a retry would silently lengthen every interrupted sleep.
     encoded = DateTime.to_iso8601(wake_at)
 
     with {:ok, _encoded} <- complete_step(context, handle, encoded) do
@@ -466,6 +482,9 @@ defmodule Absurd.Context do
   defp suspend_if_waiting(_context, 0), do: :ok
 
   defp suspend_if_waiting(context, remaining) do
+    # Commit the sleeping state before unwinding the callback. Once this succeeds
+    # the current runner must not complete the run, so signal/2 transfers control
+    # directly back to Runner.
     case terminal_or_return(
            context,
            SQL.schedule_run_after(
@@ -497,6 +516,8 @@ defmodule Absurd.Context do
   end
 
   defp await_event_in_database(context, handle, event_name, timeout) do
+    # Resolution and suspension are one database transaction. That atomic boundary
+    # closes the race where an event arrives between "not found" and "go to sleep."
     result =
       SQL.await_event(
         context.db,
@@ -524,6 +545,9 @@ defmodule Absurd.Context do
   end
 
   defp consume_event_timeout(context, event_name) do
+    # A timed event wait is resumed as another claim. The claim carries the event
+    # name with no payload, which is consumed once so a second call in this same
+    # execution does not manufacture another timeout.
     Agent.get_and_update(context.state, fn state ->
       timed_out = state.wake_event == event_name and is_nil(state.event_payload)
 
@@ -547,6 +571,8 @@ defmodule Absurd.Context do
   end
 
   defp await_child_handle(context, %Step{} = handle, queue, task_id, timeout) do
+    # Child waits occupy this runner, unlike event waits. Heartbeat at half the
+    # lease so a healthy parent cannot be reclaimed while it polls another queue.
     started_at = System.monotonic_time(:millisecond)
     heartbeat_interval = max(div(context.claim_timeout, 2), @minimum_heartbeat_interval)
 
@@ -579,6 +605,8 @@ defmodule Absurd.Context do
 
   defp poll_child_result(context, poll, %TaskResult{} = result)
        when result.state in [:completed, :failed, :cancelled] do
+    # Cache only terminal snapshots. Replaying a pending/running state would make
+    # the parent permanently observe a result that was merely transient.
     encoded = encode_task_result(result)
 
     with {:ok, value} <- complete_step(context, poll.handle, encoded) do
@@ -587,6 +615,9 @@ defmodule Absurd.Context do
   end
 
   defp poll_child_result(context, poll, _result) do
+    # Exponential polling reduces database pressure while the cap preserves
+    # reasonable completion latency. Timeout and lease clocks use monotonic time
+    # so wall-clock adjustments cannot move their deadlines.
     with {:ok, remaining} <-
            remaining_timeout(poll.timeout, poll.started_at, :await_task_result),
          {:ok, next_heartbeat} <-
@@ -693,6 +724,8 @@ defmodule Absurd.Context do
   end
 
   defp reject_current_queue(queue, queue) do
+    # If all runners in one pool synchronously waited on children in that same
+    # pool, no capacity would remain to execute those children.
     {:error,
      Error.new(:configuration, "a task cannot await another task in the same queue",
        operation: :await_task_result,
@@ -721,16 +754,23 @@ defmodule Absurd.Context do
 
   defp terminal_or_return(context, {:error, %Error{kind: kind}})
        when kind in [:cancelled, :failed_run] do
+    # These errors mean PostgreSQL has already made the run terminal. Unwind user
+    # code immediately so it cannot perform more effects or publish another state.
     signal(context, kind)
   end
 
   defp terminal_or_return(_context, result), do: result
 
   defp signal(context, reason) do
+    # The unique reference authenticates this context's private control signal;
+    # Runner will treat every other throw as a task failure.
     throw({:absurd_context_control, context.control_ref, reason})
   end
 
   defp notify_lease(context, duration) do
+    # The durable extension has already succeeded before this callback runs. A
+    # local observer failure must therefore not turn a committed operation into a
+    # reported error or invite the caller to retry it.
     try do
       context.lease_notifier.(duration)
     rescue
@@ -743,6 +783,8 @@ defmodule Absurd.Context do
   end
 
   defp start_state(checkpoints, task) do
+    # This linked Agent is intentionally disposable. It removes repeated reads and
+    # tracks occurrence order, but every value needed after a crash is in PostgreSQL.
     checkpoint_cache = Map.new(checkpoints, &{&1.checkpoint_name, &1.state})
 
     case Agent.start_link(fn ->

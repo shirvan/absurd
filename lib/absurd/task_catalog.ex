@@ -68,6 +68,8 @@ defmodule Absurd.TaskCatalog do
   defp source_modules(modules) when is_list(modules), do: {:ok, modules}
 
   defp source_modules(module) when is_atom(module) do
+    # Execute an application catalog once during pool startup. Turning failures
+    # into configuration errors keeps bad catalogs from surfacing after claims.
     with {:module, ^module} <- Code.ensure_loaded(module),
          true <- function_exported?(module, :tasks, 0),
          modules when is_list(modules) <- module.tasks() do
@@ -84,6 +86,9 @@ defmodule Absurd.TaskCatalog do
   end
 
   defp build_tasks(modules, queue) do
+    # Build the complete immutable dispatch map before exposing it to runners.
+    # reduce_while stops at the first invalid entry without returning a partial
+    # catalog that could defer otherwise-known tasks.
     Enum.reduce_while(modules, {:ok, %{}}, fn module, {:ok, tasks} ->
       case validate_task_module(module, queue) do
         {:ok, task_name} -> put_task(tasks, task_name, module)
@@ -125,6 +130,8 @@ defmodule Absurd.TaskCatalog do
   end
 
   defp put_task(tasks, task_name, module) do
+    # Durable names, rather than Elixir modules, are the wire protocol. Duplicates
+    # would make dispatch depend on list order, so reject the catalog as ambiguous.
     case tasks do
       %{^task_name => existing} ->
         error =

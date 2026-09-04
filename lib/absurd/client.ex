@@ -157,6 +157,9 @@ defmodule Absurd.Client do
   @spec spawn(t(), module() | String.t(), Absurd.JSON.value(), keyword()) ::
           {:ok, SpawnResult.t()} | {:error, Error.t()}
   def spawn(%__MODULE__{} = client, task, params, options \\ []) do
+    # Hooks may enrich spawn options, but they are not trusted to preserve the
+    # public contract. Validate both the caller's input and the hook's output
+    # before anything reaches the database.
     with {:ok, task_name} <- task_name(task),
          {:ok, options} <- validate_spawn_options(options),
          {:ok, options} <- run_before_spawn(client.hooks, task_name, params, options),
@@ -262,6 +265,8 @@ defmodule Absurd.Client do
   @doc "Creates a named queue with storage and maintenance options."
   @spec create_queue(t(), String.t(), keyword()) :: :ok | {:error, Error.t()}
   def create_queue(%__MODULE__{} = client, queue, options) do
+    # Storage mode is fixed during queue creation. Maintenance fields are applied
+    # afterward through the schema's policy API only when at least one is non-nil.
     with {:ok, options} <-
            validate_client_options(options, @queue_create_defaults, :create_queue),
          {storage_mode, policy} <- Keyword.pop(options, :storage_mode),
@@ -341,6 +346,8 @@ defmodule Absurd.Client do
   end
 
   defp resolve_spawn(client, task, options) when is_atom(task) do
+    # A registered module binds its durable name to one queue. Allowing an
+    # arbitrary override here could enqueue work where no catalog can execute it.
     metadata = task.__absurd_task__()
     registered_queue = metadata.queue || client.queue
 
@@ -349,6 +356,8 @@ defmodule Absurd.Client do
       resolved =
         options
         |> Keyword.delete(:queue)
+        # Explicit spawn options win; task metadata is next; the client is the
+        # final fallback. put_default/3 preserves that precedence.
         |> put_default(
           :max_attempts,
           metadata.default_max_attempts || client.default_max_attempts
@@ -360,6 +369,8 @@ defmodule Absurd.Client do
   end
 
   defp resolve_spawn(client, task, options) when is_binary(task) do
+    # A string name may belong to another SDK, so it has no Elixir metadata from
+    # which to infer a safe destination. Require the boundary to be explicit.
     with {:ok, queue} <- require_raw_task_queue(options[:queue]) do
       resolved =
         options
@@ -389,6 +400,8 @@ defmodule Absurd.Client do
   defp require_raw_task_queue(queue), do: Name.validate_queue(queue)
 
   defp resolve_task_reference(_client, %SpawnResult{} = spawned, nil) do
+    # Carrying the queue in SpawnResult prevents later operations from silently
+    # consulting the client's possibly different default queue.
     {:ok, spawned.queue, spawned.task_id}
   end
 
@@ -434,6 +447,8 @@ defmodule Absurd.Client do
   end
 
   defp run_before_spawn_hook(hooks, task_name, params, options) do
+    # Convert hook exceptions and malformed returns into ordinary library errors;
+    # extension code should not punch through the client's tagged-result API.
     case hooks.before_spawn(task_name, params, options) do
       {:ok, hooked_options} -> {:ok, hooked_options}
       {:error, reason} -> hook_error(:before_spawn, reason)
@@ -486,6 +501,8 @@ defmodule Absurd.Client do
   end
 
   defp await_again(client, queue, task_id, timeout, started_at, delay) do
+    # Waiting is observational: a local timeout never cancels or otherwise mutates
+    # the durable task. Monotonic time keeps the deadline stable across clock jumps.
     case remaining_timeout(timeout, started_at) do
       0 ->
         {:error,
@@ -495,6 +512,8 @@ defmodule Absurd.Client do
          )}
 
       remaining ->
+        # Back off to cap query volume, but never sleep beyond the caller's
+        # remaining timeout.
         sleep_for = if remaining == :infinity, do: delay, else: min(delay, remaining)
         Process.sleep(sleep_for)
         await_poll(client, queue, task_id, timeout, started_at, min(delay * 2, 1_000))
@@ -516,6 +535,8 @@ defmodule Absurd.Client do
   end
 
   defp maybe_set_queue_policy(client, queue, policy) do
+    # Avoid a policy write when create_queue/3 received only defaults; PostgreSQL
+    # should retain its own official defaults in that case.
     if Enum.all?(policy, fn {_key, value} -> is_nil(value) end) do
       :ok
     else

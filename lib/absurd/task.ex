@@ -44,6 +44,9 @@ defmodule Absurd.Task do
   """
   @spec __using__(keyword()) :: Macro.t()
   defmacro __using__(options) do
+    # Validate registration while compiling the task module. Worker startup can
+    # then consume inert metadata instead of discovering malformed declarations
+    # only after a durable task has been claimed.
     metadata = validate_options!(options)
 
     quote do
@@ -57,6 +60,8 @@ defmodule Absurd.Task do
   end
 
   defp validate_options!(options) when is_list(options) do
+    # Keep this list explicit: misspelled task defaults should fail compilation,
+    # not be silently ignored and replaced with runtime defaults.
     allowed = [:name, :queue, :default_max_attempts, :default_cancellation]
     unknown = Keyword.keys(options) -- allowed
 

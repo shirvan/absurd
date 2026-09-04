@@ -27,6 +27,8 @@ defmodule Absurd.Supervisor do
   defp worker_pool_child_spec(options) do
     name = Keyword.fetch!(options, :name)
 
+    # Key children by their configured OTP name so multiple queues/pools can use
+    # the same module without colliding on Supervisor's default module id.
     Supervisor.child_spec(
       {Absurd.WorkerPool, options},
       id: {Absurd.WorkerPool, name}

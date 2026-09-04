@@ -40,6 +40,8 @@ defmodule Absurd.JSON do
   """
   @spec validate(term()) :: :ok | {:error, Error.t()}
   def validate(value) do
+    # Structural validation gives precise paths for Elixir-only values. Jason is
+    # still the final authority for scalar edge cases such as non-finite floats.
     with :ok <- validate_structure(value, []),
          {:ok, _encoded} <- encode_value(value) do
       :ok
@@ -68,6 +70,8 @@ defmodule Absurd.JSON do
   end
 
   defp validate_structure(value, path) when is_map(value) and not is_struct(value) do
+    # JSON objects require string keys. Reject structs even when their underlying
+    # maps happen to contain values Jason could otherwise encode.
     Enum.reduce_while(value, :ok, fn
       {key, nested}, :ok when is_binary(key) ->
         case validate_structure(nested, [key | path]) do
@@ -111,6 +115,8 @@ defmodule Absurd.JSON do
   end
 
   defp invalid(message, path) do
+    # Traversal prepends path segments for efficiency; reverse once at the error
+    # boundary to report the path from the root value toward the invalid leaf.
     {:error, Error.new(:validation, message, metadata: %{field: :json, path: Enum.reverse(path)})}
   end
 end

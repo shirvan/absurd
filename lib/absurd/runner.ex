@@ -1,5 +1,8 @@
 defmodule Absurd.Runner do
-  # Internal temporary worker-pool child that executes exactly one claimed run.
+  # A runner is a disposable process for exactly one database claim. It owns no
+  # durable state: checkpoints, retries, and terminal status all live in
+  # PostgreSQL, so killing this process only abandons a lease that can be claimed
+  # again later.
   @moduledoc false
 
   use GenServer
@@ -30,6 +33,8 @@ defmodule Absurd.Runner do
     %{
       id: __MODULE__,
       start: {__MODULE__, :start_link, [options]},
+      # The database retry policy, not OTP restart intensity, decides whether a
+      # failed attempt gets another run.
       restart: :temporary,
       shutdown: :brutal_kill
     }
@@ -42,6 +47,8 @@ defmodule Absurd.Runner do
 
   @impl GenServer
   def handle_continue(:execute, state) do
+    # Keep arbitrary user work out of init/1 so child startup establishes a live
+    # runner promptly instead of blocking on the entire task callback.
     metadata = log_metadata(state)
     {:ok, watchdog} = LeaseWatchdog.start_link(self(), state.claim_timeout, metadata)
 
@@ -58,6 +65,8 @@ defmodule Absurd.Runner do
 
   defp execute_claim(state, watchdog) do
     case TaskCatalog.fetch(state.catalog, state.task.task_name) do
+      # Durable task names can outlive one deployed code version. Missing code is
+      # treated as a rollout mismatch, not immediately as a permanent task error.
       nil -> defer_unknown_task(state)
       task_module -> execute_known_task(state, watchdog, task_module)
     end
@@ -73,6 +82,8 @@ defmodule Absurd.Runner do
 
     case Context.new(state.db, state.queue, state.task, context_options) do
       {:ok, context} ->
+        # Context owns its short-lived cache process. Always close it before the
+        # runner publishes the terminal database transition.
         outcome = execute_task_callback(state, task_module, context)
         Context.close(context)
         finalize_outcome(state, outcome)
@@ -92,6 +103,9 @@ defmodule Absurd.Runner do
     rescue
       exception -> {:failure, exception, __STACKTRACE__}
     catch
+      # Context uses a private, reference-tagged throw for non-local control flow
+      # such as durable sleep or cancellation. Matching the reference prevents a
+      # task's unrelated throw from impersonating an internal control signal.
       :throw, {:absurd_context_control, ^control_ref, reason}
       when reason in [:suspended, :cancelled, :failed_run] ->
         {:control, reason}
@@ -106,6 +120,8 @@ defmodule Absurd.Runner do
   end
 
   defp invoke_task_hook(hooks, task_module, params, context) do
+    # Give the hook a continuation so it can bracket execution (for tracing,
+    # timing, or context setup) without replacing the task dispatch contract.
     if function_exported?(hooks, :wrap_task_execution, 2) do
       hooks.wrap_task_execution(context, fn -> task_module.run(params, context) end)
     else
@@ -126,6 +142,8 @@ defmodule Absurd.Runner do
     {:failure, exception, []}
   end
 
+  # Context has already committed these transitions in the database. Writing a
+  # second terminal outcome here could overwrite cancellation or wake scheduling.
   defp finalize_outcome(_state, {:control, :suspended}), do: :suspended
   defp finalize_outcome(_state, {:control, :cancelled}), do: :cancelled
   defp finalize_outcome(_state, {:control, :failed_run}), do: :already_failed
@@ -142,9 +160,13 @@ defmodule Absurd.Runner do
         :already_failed
 
       {:error, %Error{kind: :ambiguous} = error} ->
+        # Retrying a write whose outcome is unknown can turn a successful commit
+        # into a contradictory failure. Leave reconciliation to durable state.
         log_ambiguous(state, :complete_run, error)
 
       {:error, %Error{} = error} ->
+        # A definitive rejection means completion did not commit. Record that as
+        # an attempt failure so the database retry policy still gets the decision.
         fail_run(state, error, [])
     end
   end
@@ -154,6 +176,9 @@ defmodule Absurd.Runner do
   end
 
   defp fail_run(state, reason, stacktrace) do
+    # Failure serialization is deliberately bounded before it crosses the
+    # database boundary. The SQL function applies the durable retry policy and
+    # chooses whether the task becomes pending again or terminally failed.
     failure = Failure.serialize(reason, stacktrace)
     options = [query_options: state.query_options]
 
@@ -181,6 +206,8 @@ defmodule Absurd.Runner do
   end
 
   defp defer_unknown_task(state) do
+    # Deterministic per-run jitter prevents every worker from repeatedly claiming
+    # an unavailable task at the same instant during a rolling deployment.
     delay = @unknown_task_base + unknown_task_jitter(state.task.run_id) * 1_000
 
     case SQL.schedule_run_after(
@@ -213,6 +240,8 @@ defmodule Absurd.Runner do
   end
 
   defp log_ambiguous(state, operation, error) do
+    # There is intentionally no compensating write here: a lost response does not
+    # tell us whether PostgreSQL committed, and guessing would weaken correctness.
     Logger.error(
       "Absurd worker could not observe a durable write outcome",
       log_metadata(state) ++ [operation: operation, error_kind: error.kind]
@@ -241,6 +270,8 @@ defmodule Absurd.Runner do
   end
 
   defp unknown_task_jitter(run_id) do
+    # Use an explicit 32-bit FNV-1a hash rather than VM-local hashing so the same
+    # durable UUID maps to the same delay bucket on every worker.
     hash =
       run_id
       |> canonical_uuid()

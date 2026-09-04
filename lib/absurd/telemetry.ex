@@ -80,6 +80,9 @@ defmodule Absurd.Telemetry do
   end
 
   defp execute_span(event, metadata, started_at, function) do
+    # Emit exactly one terminal event. Tagged error returns are ordinary stops;
+    # raised, thrown, and exited control flow is observed as an exception and then
+    # re-raised unchanged so instrumentation cannot alter program semantics.
     result = function.()
     measurements = %{duration: System.monotonic_time() - started_at}
     stop_metadata = Map.merge(metadata, outcome_metadata(result))
@@ -119,6 +122,8 @@ defmodule Absurd.Telemetry do
   defp outcome_metadata(_result), do: %{outcome: :success}
 
   defp ensure_valid_utf8(value, maximum) do
+    # Durable names are application input. Bound and sanitize them before they
+    # become log/metric dimensions, without ever attaching params or results.
     if String.valid?(value) do
       value
     else
@@ -127,6 +132,7 @@ defmodule Absurd.Telemetry do
   end
 
   defp valid_prefix(value, size) do
+    # Do not split a multi-byte character when enforcing the byte budget.
     prefix = binary_part(value, 0, size)
 
     if String.valid?(prefix) do

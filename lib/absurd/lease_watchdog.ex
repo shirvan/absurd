@@ -1,5 +1,7 @@
 defmodule Absurd.LeaseWatchdog do
-  # Internal process isolated from a runner so lease timeouts can terminate it.
+  # The watchdog is isolated from its runner so it can observe time passing even
+  # while user code blocks that runner's mailbox. PostgreSQL still owns the lease;
+  # this process is a local backstop for callbacks that fail to heartbeat.
   @moduledoc false
 
   use GenServer
@@ -40,6 +42,8 @@ defmodule Absurd.LeaseWatchdog do
 
   @impl GenServer
   def handle_cast({:reset, lease_duration}, state) do
+    # Context calls reset only after PostgreSQL confirms an extension. Replacing
+    # both timers keeps the local deadline aligned with that durable lease.
     cancel_timer(state.warning_timer)
     cancel_timer(state.hard_timer)
     {:noreply, schedule(state.owner, lease_duration, state.metadata)}
@@ -52,6 +56,8 @@ defmodule Absurd.LeaseWatchdog do
   end
 
   def handle_info({:lease_timeout, token}, %{token: token} = state) do
+    # One lease duration produces a diagnostic warning; two is the hard safety
+    # bound. Killing the disposable runner lets its claim expire and be retried.
     Logger.error(
       "Absurd task exceeded twice its active claim lease; terminating runner",
       state.metadata
@@ -64,6 +70,8 @@ defmodule Absurd.LeaseWatchdog do
   def handle_info(_message, state), do: {:noreply, state}
 
   defp schedule(owner, lease_duration, metadata) do
+    # Timer cancellation can race with mailbox delivery. The shared token makes
+    # messages from an older lease harmless through the catch-all handler above.
     token = make_ref()
 
     %{
