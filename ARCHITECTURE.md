@@ -143,6 +143,8 @@ separate sleep write. Event delivery later makes the run claimable again.
 
 The control signal contains a unique context reference. The runner recognizes
 only a signal from the current context; unrelated task throws remain failures.
+An ambiguous context write also unwinds through this signal and suppresses
+competing finalization, since the run may already have durably suspended.
 
 ## Leases and stuck work
 

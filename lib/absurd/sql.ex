@@ -570,9 +570,8 @@ defmodule Absurd.SQL do
           keyword()
         ) :: :ok | {:error, Error.t()}
   def set_task_checkpoint_state(db, queue, task_id, step_name, state, owner_run_id, options \\ []) do
-    # The upstream function verifies claim ownership, persists the checkpoint,
-    # and optionally extends the lease as one operation. Splitting those actions
-    # client-side would leave a committed effect paired with an expired claim.
+    # Delegate checkpoint persistence and optional lease extension to the
+    # database's checkpoint function in a single call.
     statement = """
     SELECT absurd.set_task_checkpoint_state($1, $2, $3, $4::jsonb, $5, $6)
     """

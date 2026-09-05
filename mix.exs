@@ -5,7 +5,7 @@ defmodule Absurd.MixProject do
   def project do
     [
       app: :absurd,
-      version: "0.2.0",
+      version: "0.2.1",
       description: "Unofficial Elixir SDK and OTP workers for Absurd",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
@@ -44,7 +44,7 @@ defmodule Absurd.MixProject do
     [
       main: "readme",
       source_url: "https://github.com/shirvan/absurd",
-      source_ref: "0.2.0",
+      source_ref: "0.2.1",
       extras: [
         "README.md",
         "ARCHITECTURE.md",

@@ -205,12 +205,13 @@ defmodule Absurd.Context do
   Allocates one deterministic checkpoint occurrence and returns its handle.
 
   Repeated uses of a logical name become `name`, `name#2`, and so on. A handle
-  with `done: true` contains the committed value in `value`.
+  with `done: true` contains the committed value in `value`. Names that collide
+  with an occurrence already allocated in this execution are rejected.
   """
   @spec begin_step(t(), String.t()) :: {:ok, Step.t()} | {:error, Error.t()}
   def begin_step(%__MODULE__{} = context, name) do
     with {:ok, name} <- Name.validate_durable(name, :step),
-         checkpoint_name <- allocate_checkpoint_name(context, name),
+         {:ok, checkpoint_name} <- allocate_checkpoint_name(context, name),
          {:ok, checkpoint} <- lookup_checkpoint(context, checkpoint_name) do
       {:ok, step_handle(name, checkpoint_name, checkpoint)}
     end
@@ -412,7 +413,20 @@ defmodule Absurd.Context do
     Agent.get_and_update(context.state, fn state ->
       count = Map.get(state.counters, name, 0) + 1
       checkpoint_name = if count == 1, do: name, else: "#{name}##{count}"
-      {checkpoint_name, put_in(state, [:counters, name], count)}
+
+      if MapSet.member?(state.allocated_names, checkpoint_name) do
+        {validation_error(:begin_step, "step name collides with an allocated occurrence", %{
+           checkpoint_name: checkpoint_name
+         }), state}
+      else
+        next = %{
+          state
+          | counters: Map.put(state.counters, name, count),
+            allocated_names: MapSet.put(state.allocated_names, checkpoint_name)
+        }
+
+        {{:ok, checkpoint_name}, next}
+      end
     end)
   end
 
@@ -759,6 +773,12 @@ defmodule Absurd.Context do
     signal(context, kind)
   end
 
+  defp terminal_or_return(context, {:error, %Error{kind: :ambiguous} = error}) do
+    # The run may already be sleeping. Stop callback effects and let the runner
+    # report uncertainty without publishing a contradictory completion/failure.
+    signal(context, {:ambiguous, error})
+  end
+
   defp terminal_or_return(_context, result), do: result
 
   defp signal(context, reason) do
@@ -791,6 +811,7 @@ defmodule Absurd.Context do
            %{
              checkpoints: checkpoint_cache,
              counters: %{},
+             allocated_names: MapSet.new(),
              wake_event: task.wake_event,
              event_payload: task.event_payload
            }

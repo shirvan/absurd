@@ -6,13 +6,16 @@ defmodule Absurd.WorkerPostgreSQLTest do
   alias Absurd.Client
   alias Absurd.SQL
   alias Absurd.TaskResult
+  alias Absurd.TestPostgreSQLResponseProxy
   alias Absurd.TestWorkerHooks
+  alias Absurd.TestWorkerTasks.AmbiguousResult
   alias Absurd.TestWorkerTasks.Echo
   alias Absurd.TestWorkerTasks.Event
   alias Absurd.TestWorkerTasks.Gate
   alias Absurd.TestWorkerTasks.Hangs
   alias Absurd.TestWorkerTasks.Raises
   alias Absurd.TestWorkerTasks.Replay
+  alias Absurd.TestWorkerTasks.UncertainWrite
   alias Absurd.WorkerPool
 
   @probe __MODULE__.Probe
@@ -73,6 +76,72 @@ defmodule Absurd.WorkerPostgreSQLTest do
 
     assert is_integer(duration)
     assert stop_metadata.outcome == :completed
+  end
+
+  for {name, operation, expected_state} <- [
+        {"sleep", :schedule_run_after, :sleeping},
+        {"event", :await_event, :sleeping},
+        {"checkpoint", :set_task_checkpoint_state, :running},
+        {"heartbeat", :extend_claim, :running}
+      ] do
+    @tag :capture_log
+    test "a lost #{name} response unwinds without a competing finalization", context do
+      operation = unquote(operation)
+      proxy = start_supervised!({TestPostgreSQLResponseProxy, context.db_options})
+
+      db_options =
+        Keyword.merge(context.db_options,
+          hostname: "127.0.0.1",
+          port: TestPostgreSQLResponseProxy.port(proxy),
+          ssl: false
+        )
+
+      db = start_supervised!({Postgrex, db_options})
+      _pool = start_pool(context, [UncertainWrite], db: db, claim_timeout: 10_000)
+      attach_write_fault(proxy, operation)
+      attach_finalization_events()
+
+      assert {:ok, spawned} =
+               Client.spawn(context.client, UncertainWrite, %{"operation" => unquote(name)},
+                 max_attempts: 1
+               )
+
+      assert_receive {:response_dropped, ^operation}, 3_000
+
+      assert_receive {[:absurd, :runner, :execute, :stop], _measurements, %{outcome: :ambiguous}},
+                     3_000
+
+      refute_received {[:absurd, :sql, :fail_run, :start], _, _}
+      refute_received {[:absurd, :sql, :complete_run, :start], _, _}
+      refute_received {:continued_after_write, _operation}
+
+      assert {:ok, %TaskResult{state: unquote(expected_state)}} =
+               Client.fetch_task_result(context.client, spawned)
+
+      assert_committed_effect(operation, context, spawned)
+    end
+  end
+
+  for raise? <- [false, true] do
+    @tag :capture_log
+    test "an ambiguous error #{if raise?, do: "raised", else: "returned"} by task code is preserved",
+         context do
+      _pool = start_pool(context, [AmbiguousResult])
+      attach_finalization_events()
+
+      assert {:ok, spawned} =
+               Client.spawn(context.client, AmbiguousResult, %{"raise" => unquote(raise?)},
+                 max_attempts: 1
+               )
+
+      assert_receive {[:absurd, :runner, :execute, :stop], _measurements, %{outcome: :ambiguous}},
+                     2_000
+
+      refute_received {[:absurd, :sql, :fail_run, :start], _, _}
+
+      assert {:ok, %TaskResult{state: :sleeping}} =
+               Client.fetch_task_result(context.client, spawned)
+    end
   end
 
   test "retries from the beginning and replays committed checkpoints", context do
@@ -368,21 +437,42 @@ defmodule Absurd.WorkerPostgreSQLTest do
       ]
       |> Keyword.merge(overrides)
 
-    assert {:ok, pool} = WorkerPool.start_link(options)
-    Process.unlink(pool)
-
-    on_exit(fn ->
-      if Process.alive?(pool) do
-        try do
-          Supervisor.stop(pool, :normal, 5_000)
-        catch
-          :exit, _reason -> :ok
-        end
-      end
-    end)
-
-    pool
+    start_supervised!(Supervisor.child_spec({WorkerPool, options}, restart: :temporary))
   end
+
+  defp attach_write_fault(proxy, operation) do
+    id = {__MODULE__, :fault, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:absurd, :sql, operation, :start],
+        &TestPostgreSQLResponseProxy.arm_on_query/4,
+        {proxy, self()}
+      )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
+  defp attach_finalization_events do
+    id = {__MODULE__, :finalization, make_ref()}
+
+    events = [
+      [:absurd, :runner, :execute, :stop],
+      [:absurd, :sql, :fail_run, :start],
+      [:absurd, :sql, :complete_run, :start]
+    ]
+
+    :ok = :telemetry.attach_many(id, events, &Absurd.TestTelemetryHandler.handle_event/4, self())
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
+  defp assert_committed_effect(:set_task_checkpoint_state, context, spawned) do
+    assert {:ok, %{state: 42}} =
+             SQL.get_task_checkpoint_state(context.db, context.queue, spawned.task_id, "effect")
+  end
+
+  defp assert_committed_effect(_operation, _context, _spawned), do: :ok
 
   defp wait_for_state(client, task, expected_state) do
     deadline = System.monotonic_time(:millisecond) + 2_000

@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.1 - 2026-09-04
+
+### Fixed
+
+- Preserve ambiguous context, returned, and raised write errors without a
+  competing completion or failure transition.
+- Reject checkpoint occurrence collisions while retaining existing names.
+
 ## 0.2.0 - 2026-09-04
 
 ### Added

@@ -38,7 +38,7 @@ Add the package from [Hex](https://hex.pm/packages/absurd) to `mix.exs`:
 ```elixir
 def deps do
   [
-    {:absurd, "~> 0.2.0"}
+    {:absurd, "~> 0.2.1"}
   ]
 end
 ```
@@ -459,6 +459,7 @@ committed JSON value on later attempts:
 Repeating the same logical name in one execution allocates deterministic names
 such as `load-customer:v2`, `load-customer:v2#2`, and so on. Keep task control
 flow deterministic across attempts so the same occurrences mean the same work.
+An explicit name that collides with an allocated occurrence is rejected.
 
 ### Make an external effect idempotent
 

@@ -19,11 +19,12 @@ defmodule Absurd.PostgreSQLCase do
 
   setup_all do
     database_url = System.fetch_env!("ABSURD_INTEGRATION_DATABASE_URL")
-    db = start_supervised!({Postgrex, connection_options(database_url)})
+    db_options = connection_options(database_url)
+    db = start_supervised!({Postgrex, db_options})
 
     assert :ok = SQL.verify_schema_version(db)
 
-    {:ok, db: db}
+    {:ok, db: db, db_options: db_options}
   end
 
   setup %{db: db} do

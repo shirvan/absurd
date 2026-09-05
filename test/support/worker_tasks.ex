@@ -116,3 +116,40 @@ defmodule Absurd.TestWorkerHooks do
     result
   end
 end
+
+defmodule Absurd.TestWorkerTasks.UncertainWrite do
+  @moduledoc false
+
+  use Absurd.Task, name: "worker-uncertain-write"
+
+  @impl Absurd.Task
+  def run(%{"operation" => operation}, context) do
+    result =
+      case operation do
+        "sleep" -> Absurd.Context.sleep_for(context, "nap", 60_000)
+        "event" -> Absurd.Context.await_event(context, "approval")
+        "checkpoint" -> Absurd.Context.step(context, "effect", fn -> {:ok, 42} end)
+        "heartbeat" -> Absurd.Context.heartbeat(context, 60_000)
+      end
+
+    Absurd.TestWorkerProbe.notify({:continued_after_write, operation})
+
+    case result do
+      :ok -> {:ok, nil}
+      tagged -> tagged
+    end
+  end
+end
+
+defmodule Absurd.TestWorkerTasks.AmbiguousResult do
+  @moduledoc false
+
+  use Absurd.Task, name: "worker-ambiguous-result"
+
+  @impl Absurd.Task
+  def run(%{"raise" => raise?}, context) do
+    :ok = Absurd.SQL.schedule_run_after(context.db, context.queue, context.run_id, 60_000)
+    error = Absurd.Error.new(:ambiguous, "injected lost response", operation: :schedule_run_after)
+    if raise?, do: raise(error), else: {:error, error}
+  end
+end

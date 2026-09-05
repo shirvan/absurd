@@ -110,6 +110,9 @@ defmodule Absurd.Runner do
       when reason in [:suspended, :cancelled, :failed_run] ->
         {:control, reason}
 
+      :throw, {:absurd_context_control, ^control_ref, {:ambiguous, %Error{} = error}} ->
+        {:ambiguous, error}
+
       kind, reason ->
         {:failure, {kind, reason}, __STACKTRACE__}
     end
@@ -148,6 +151,10 @@ defmodule Absurd.Runner do
   defp finalize_outcome(_state, {:control, :cancelled}), do: :cancelled
   defp finalize_outcome(_state, {:control, :failed_run}), do: :already_failed
 
+  defp finalize_outcome(state, {:ambiguous, error}) do
+    log_ambiguous(state, error.operation, error)
+  end
+
   defp finalize_outcome(state, {:success, result}) do
     case SQL.complete_run(state.db, state.queue, state.task.run_id, result, state.query_options) do
       :ok ->
@@ -169,6 +176,12 @@ defmodule Absurd.Runner do
         # an attempt failure so the database retry policy still gets the decision.
         fail_run(state, error, [])
     end
+  end
+
+  defp finalize_outcome(state, {:failure, %Error{kind: :ambiguous} = error, _stacktrace}) do
+    # Also preserve ambiguous errors propagated or raised by application code
+    # using the low-level SQL API rather than a context control signal.
+    log_ambiguous(state, error.operation, error)
   end
 
   defp finalize_outcome(state, {:failure, reason, stacktrace}) do
